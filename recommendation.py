@@ -3,14 +3,42 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
+import firebase_admin
+from firebase_admin import credentials, firestore
+from firebase_config import db
 
-# Load datasets
+# Initialize Firestore DB
+db = firestore.client()
+
+# # Load datasets from Firestore
+# def load_firestore_data(collection_name):
+#     docs = db.collection(collection_name).stream()
+#     data = []
+#     for doc in docs:
+#         data.append(doc.to_dict())
+#     return pd.DataFrame(data)
+
+# def load_firestore_subcollection_data(collection_name, subcollection_name):
+#     docs = db.collection(collection_name).stream()
+#     data = []
+#     for doc in docs:
+#         subcollection_docs = db.collection(collection_name).document(doc.id).collection(subcollection_name).stream()
+#         for sub_doc in subcollection_docs:
+#             sub_doc_data = sub_doc.to_dict()
+#             sub_doc_data['parent_id'] = doc.id  # Add reference to parent document
+#             data.append(sub_doc_data)
+#     return pd.DataFrame(data)
+
+# restDatasets = load_firestore_data('restaurant')
+# menuDatasets = load_firestore_subcollection_data('restaurant', 'menuItems')
+
+# Load datasets from CSV
 restDatasets = pd.read_csv('GoogleReview_Penang.csv')
 menuDatasets = pd.read_csv('Restaurants_Penang_Menu.csv')
 
 # Combine restaurant name and cuisine into one column
-restDatasets['NameCuisine'] = restDatasets['Restaurant'] + \
-    ' ' + restDatasets['Cuisine']
+restDatasets['NameCuisine'] = restDatasets['restaurantName'] + \
+    ' ' + restDatasets['restaurantCuisine']
 
 # create tfidf vectorizer
 tfidf = TfidfVectorizer(stop_words=None)
@@ -75,7 +103,8 @@ def build_feature_matrix(restaurant_data, user_input):
     normalized_cuisine_scores = normalize_features(cuisine_scores)
 
     # Normalize ratings
-    normalized_ratings = normalize_features(restaurant_data['Rating'].values)
+    normalized_ratings = normalize_features(
+        restaurant_data['restaurantRating'].values)
 
     # Combine all features
     combined_matrix = np.hstack([
@@ -172,12 +201,12 @@ def get_top_menu_items(restaurantName, menu_data, user_allergy, user_diet, max_i
         additional_items = non_bestsellers.head(remaining_slots)
         top_items = pd.concat([top_items, additional_items])
 
-    return top_items[['itemName', 'itemDescription', 'itemPrice', 'itemCategory', 'itemAllergens', 'itemNutritionalValue']].to_dict(orient='records')
+    return top_items[['itemName']].to_dict(orient='records')
 
 
 def get_similar_restaurants(favorite, restaurant_data, tfidf_vectorizer):
     # Generate TF-IDF features for favorite restaurant
-    favorite_desc = restaurant_data[restaurant_data['Restaurant']
+    favorite_desc = restaurant_data[restaurant_data['restaurantName']
                                     == favorite]['NameCuisine'].values[0]
     favorite_vector = tfidf_vectorizer.transform([favorite_desc]).toarray()[0]
 
@@ -188,7 +217,7 @@ def get_similar_restaurants(favorite, restaurant_data, tfidf_vectorizer):
             [row['NameCuisine']]).toarray()[0]
         similarity_score = cosine_similarity(favorite_vector.reshape(
             1, -1), restaurant_vector.reshape(1, -1))[0][0]
-        similarity_scores.append((row['Restaurant'], similarity_score))
+        similarity_scores.append((row['restaurantName'], similarity_score))
 
     # Sort by similarity score and return names of similar restaurants
     similar_restaurants = [name for name, score in sorted(
@@ -197,6 +226,7 @@ def get_similar_restaurants(favorite, restaurant_data, tfidf_vectorizer):
 
 
 def user_preference_recommend(user_input, user_allergy, user_diet, n_recommendations, user_halal, user_history, user_favourites):
+
     restaurant_data = restDatasets
     menu_data = menuDatasets
 
@@ -222,47 +252,62 @@ def user_preference_recommend(user_input, user_allergy, user_diet, n_recommendat
     # Define feature weights (without distance)
     feature_weights = {
         'tfidf': 0.5,
-        'cuisine': 0.3,
-        'rating': 0.2
+        'restaurantCuisine': 0.3,
+        'restaurantRating': 0.2
     }
 
     # Calculate scores for all restaurants
     scores = np.array([calculate_restaurant_score(restaurant_features, user_profile, feature_weights)
                        for restaurant_features in combined_matrix])
 
-    # if restaurant has been recommended, then lower the score of the recommendation
+    # Apply penalties and boosts
     for index, restaurant in filtered_data.iterrows():
-        if restaurant['Restaurant'] in user_history:
-            scores[index] *= 0.8  # Apply penalty to lower the score
+        if restaurant['restaurantName'] in user_history:
+            scores[index] *= 0.8  # Apply penalty
 
-    # Boost scores for similar restaurants to user favorites
     for favourite in user_favourites:
         similar_restaurants = get_similar_restaurants(
             favourite, filtered_data, tfidf_vectorizer)
         for similar_restaurant in similar_restaurants:
-            if similar_restaurant in filtered_data['Restaurant'].values:
-                idx = filtered_data[filtered_data['Restaurant']
+            if similar_restaurant in filtered_data['restaurantName'].values:
+                idx = filtered_data[filtered_data['restaurantName']
                                     == similar_restaurant].index[0]
-                scores[idx] *= 1.2  # Boost score to prioritize
+                scores[idx] *= 1.2  # Boost score
 
     # Get top recommendations
-    top_indices = scores.argsort()[::-1][:n_recommendations]
+    top_indices = scores.argsort()[::-1]
 
+    # Limit recommendations by cuisine if user has multiple preferences
+    cuisine_count = {}
     recommended_restaurants = []
+    total_recommendations = 0
+    max_per_cuisine = n_recommendations // 2 if len(
+        user_cuisines) > 1 else n_recommendations
 
     for index in top_indices:
+        if total_recommendations >= n_recommendations:
+            break
+
         restaurant = filtered_data.iloc[index]
-        score = scores[index]
+        cuisine = restaurant['restaurantCuisine']
 
-        # Get top menu items
-        top_menu_items = get_top_menu_items(
-            restaurant['Restaurant'], menu_data, user_allergy, user_diet,)
+        if cuisine not in cuisine_count:
+            cuisine_count[cuisine] = 0
 
-        recommended_restaurants.append({
-            'Restaurant': restaurant,
-            'Score': score,
-            'Top Menu Items': top_menu_items
-        })
+        if cuisine_count[cuisine] < max_per_cuisine:
+            score = scores[index]
+            top_menu_items = get_top_menu_items(
+                restaurant['restaurantName'], menu_data, user_allergy, user_diet)
+
+            recommended_restaurants.append({
+                'Restaurant': restaurant,
+                'Score': score,
+                'Top Menu Items': top_menu_items
+            })
+
+            cuisine_count[cuisine] += 1
+            total_recommendations += 1
+
     return recommended_restaurants
 
 
@@ -280,8 +325,8 @@ def calculate_restaurant_score(restaurant_features, user_profile, feature_weight
 
     final_score = (
         feature_weights['tfidf'] * tfidf_score +
-        feature_weights['cuisine'] * cuisine_score +
-        feature_weights['rating'] * rating_score
+        feature_weights['restaurantCuisine'] * cuisine_score +
+        feature_weights['restaurantRating'] * rating_score
     )
 
     return final_score
