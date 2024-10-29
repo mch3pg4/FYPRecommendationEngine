@@ -6,6 +6,8 @@ from sklearn.preprocessing import MinMaxScaler
 import firebase_admin
 from firebase_admin import credentials, firestore
 from firebase_config import db
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
 
 # Initialize Firestore DB
 db = firestore.client()
@@ -67,8 +69,6 @@ tfidf_matrix_menu = tfidf_menu.fit_transform(menuDatasets['itemNameDesc'])
 similarity_menu = cosine_similarity(tfidf_matrix_menu)
 
 # start recommendation on restaurants
-
-
 def filter_restaurants_by_halal(restaurant_data, user_halal):
     if user_halal.lower() == 'yes':
         return restaurant_data[restaurant_data['isHalal'].str.lower() == 'yes']
@@ -224,6 +224,25 @@ def get_similar_restaurants(favorite, restaurant_data, tfidf_vectorizer):
         similarity_scores, key=lambda x: x[1], reverse=True)[:5]]
     return similar_restaurants
 
+def calculate_restaurant_score(restaurant_features, user_profile, feature_weights):
+    # Split features into groups
+    # Adjust index based on your feature order
+    tfidf_features = restaurant_features[:-2]
+    cuisine_features = restaurant_features[-2:-1]
+    rating_feature = restaurant_features[-1]
+
+    tfidf_score = cosine_similarity(tfidf_features.reshape(
+        1, -1), user_profile[:-2].reshape(1, -1))[0][0]
+    cuisine_score = np.dot(cuisine_features, user_profile[-2:-1])
+    rating_score = rating_feature
+
+    final_score = (
+        feature_weights['tfidf'] * tfidf_score +
+        feature_weights['restaurantCuisine'] * cuisine_score +
+        feature_weights['restaurantRating'] * rating_score
+    )
+
+    return final_score
 
 def user_preference_recommend(user_input, user_allergy, user_diet, n_recommendations, user_halal, user_history, user_favourites):
 
@@ -262,8 +281,9 @@ def user_preference_recommend(user_input, user_allergy, user_diet, n_recommendat
 
     # Apply penalties and boosts
     for index, restaurant in filtered_data.iterrows():
-        if restaurant['restaurantName'] in user_history:
+        if any(restaurant['restaurantName'] == entry['restaurantName'] for entry in user_history):
             scores[index] *= 0.8  # Apply penalty
+
 
     for favourite in user_favourites:
         similar_restaurants = get_similar_restaurants(
@@ -310,23 +330,90 @@ def user_preference_recommend(user_input, user_allergy, user_diet, n_recommendat
 
     return recommended_restaurants
 
+# Function to create a user preference vector
+def build_user_profile_vector(user_diet, user_cuisine, user_allergy, user_favorites):
+    diet_vector = tfidf.transform([' '.join(user_diet)]).toarray()[0]
+    cuisine_vector = tfidf.transform([' '.join(user_cuisine)]).toarray()[0]
+    allergy_vector = tfidf.transform([' '.join(user_allergy)]).toarray()[0]
+    if user_favorites:
+        favorites_vector = tfidf.transform(user_favorites).toarray().sum(axis=0)
+    else:
+        favorites_vector = np.zeros(tfidf.transform(['']).shape[1])
 
-def calculate_restaurant_score(restaurant_features, user_profile, feature_weights):
-    # Split features into groups
-    # Adjust index based on your feature order
-    tfidf_features = restaurant_features[:-2]
-    cuisine_features = restaurant_features[-2:-1]
-    rating_feature = restaurant_features[-1]
+    combined_vector = np.concatenate((diet_vector, cuisine_vector, allergy_vector, favorites_vector))
+    return combined_vector
 
-    tfidf_score = cosine_similarity(tfidf_features.reshape(
-        1, -1), user_profile[:-2].reshape(1, -1))[0][0]
-    cuisine_score = np.dot(cuisine_features, user_profile[-2:-1])
-    rating_score = rating_feature
+# Create user profiles based on preferences
+def create_user_profiles(users_data):
+    user_profiles = {}
+    for user in users_data:
+        profile_vector = build_user_profile_vector(
+            user['userDiets'], user['userCuisines'], user['userAllergens'], user['favouriteRestaurants']
+        )
+        user_profiles[user['userId']] = profile_vector
+    return user_profiles
 
-    final_score = (
-        feature_weights['tfidf'] * tfidf_score +
-        feature_weights['restaurantCuisine'] * cuisine_score +
-        feature_weights['restaurantRating'] * rating_score
-    )
+def get_similar_users_knn(target_user_id, user_profiles, n_neighbors=5):
+    # Convert user_profiles dictionary to list and keep track of user IDs
+    user_ids = list(user_profiles.keys())
+    profiles_matrix = np.array([user_profiles[user_id] for user_id in user_ids])
+    
+    # Adjust n_neighbors to the maximum possible value based on available users
+    n_neighbors = min(n_neighbors, len(user_ids) - 1)
+    
+    # Fit KNN model
+    knn = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine')
+    knn.fit(profiles_matrix)
+    
+    # Get the index of the target user in user_ids
+    target_index = user_ids.index(target_user_id)
+    target_profile = profiles_matrix[target_index].reshape(1, -1)
+    
+    # Find n_neighbors most similar users (excluding the target user)
+    distances, indices = knn.kneighbors(target_profile)
+    
+    # Retrieve user IDs of similar users
+    similar_users = [user_ids[idx] for idx in indices.flatten() if user_ids[idx] != target_user_id]
+    return similar_users
 
-    return final_score
+
+# hybrid recommendation function
+def hybrid_recommendation(user_id, user_input, user_allergy, user_diet, n_recommendations, user_halal, user_history, user_favourites, users_data):
+    # Generate collaborative recommendations
+    user_profiles = create_user_profiles(users_data)
+    similar_users = get_similar_users_knn(user_id, user_profiles)
+    
+    collaborative_scores = {}
+    has_collaborative_data = False
+
+    for similar_user in similar_users:
+        recommendation_history = users_data[similar_user].get('recommendedHistory', {})
+        if recommendation_history:
+            has_collaborative_data = True
+            for recommendation in recommendation_history:
+                if recommendation not in user_history:
+                    collaborative_scores[recommendation] = collaborative_scores.get(recommendation, 0) + 1
+
+    # Adjust weight for collaborative score if data is sparse
+    collaborative_weight = 0.4 if has_collaborative_data else 0
+    content_weight = 1.0 if not has_collaborative_data else 0.6
+
+    # Get top recommendations from content-based approach
+    content_recommendations = user_preference_recommend(user_input, user_allergy, user_diet, n_recommendations, user_halal, user_history, user_favourites)
+    
+    # Combine scores using weighted average
+    final_recommendations = []
+    for restaurant in content_recommendations:
+        score = restaurant['Score']
+        collaborative_score = collaborative_scores.get(restaurant['Restaurant']['restaurantName'], 0)
+        final_score = (content_weight * score) + (collaborative_weight * collaborative_score)
+        
+        final_recommendations.append({
+            'Restaurant': restaurant['Restaurant'],
+            'Score': final_score,
+            'Top Menu Items': restaurant['Top Menu Items']
+        })
+    
+    # Sort by final score
+    final_recommendations.sort(key=lambda x: x['Score'], reverse=True)
+    return final_recommendations[:n_recommendations]
