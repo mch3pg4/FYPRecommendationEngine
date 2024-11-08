@@ -93,22 +93,22 @@ def get_restaurant_and_menu_data():
 
     return jsonify(restaurant_list), 200
 
-
-# @app.route('/recommend', methods=['POST'])
+# @app.route('/recommend', methods=['GET'])
 # def recommend():
 #     try:
 #         # get user id from the POST request
-#         user_id = request.json.get('userId')
-#         # user_id = "DRQlrqYsR2TEPbFsMixvyULNxZs2"
+#         # user_id = request.json.get('userId')
+#         user_id = "DRQlrqYsR2TEPbFsMixvyULNxZs2"
 #         print(user_id)
 
-@app.route('/recommend', methods=['GET'])
+
+@app.route('/recommend', methods=['POST'])
 def recommend():
     try:
         # get user id from the POST request
-        # user_id = request.json.get('userId')
-        user_id = "DRQlrqYsR2TEPbFsMixvyULNxZs2"
+        user_id = request.json.get('userId')
         print(user_id)
+
 
         if not user_id:
             return jsonify({'error': 'User ID not provided'}), 400
@@ -179,7 +179,7 @@ def recommend():
                     })
 
 
-        n_recommendations = 3
+        n_recommendations = 5
 
         # Convert user input from list to string
         user_input = ', '.join(user_input)
@@ -188,9 +188,6 @@ def recommend():
         user_allergy = ', '.join(user_allergy)
 
         # Recommendation function
-        # recommended_restaurants = user_preference_recommend(
-        #     user_input, user_allergy, user_diet, n_recommendations, user_halal, user_history, user_favourites
-        # )
         recommended_restaurants = hybrid_recommendation(user_id, user_input, user_allergy, user_diet, n_recommendations,
                                                         user_halal, user_history, user_favourites, user_list)
 
@@ -214,6 +211,7 @@ def recommend():
         return jsonify(recommendations_list), 200
 
     except Exception as e:
+        print(e)
         return jsonify({'error': str(e)}), 500
 
 
